@@ -5,10 +5,7 @@ import math
 import numpy as np
 import copy 
 
-#参数
-# embedding = nn.Embedding(10,3)
-# input1 = torch.LongTensor([[1,2,4,5],[4,3,2,9]])
-# print(embedding(input1))
+
 #构建Embedding类来实现文本嵌入层
 class Embedding(nn.Module):
     def __init__(self, d_model, vocab):
@@ -45,12 +42,17 @@ class PositionalEncoding(nn.Module):
         #定义一个变换矩阵div_term,跳跃式的初始化
         div_term = torch.exp(torch.arange(0,d_model,2) * -(math.log(10000.0) / d_model))
 
-        #对变换矩阵进行奇偶数分别赋值
+        #对变换矩阵进行奇偶数分别赋值 用三角函数 好使
         pe[:,0::2] = torch.sin(position * div_term)
         pe[:,1::2] = torch.cos(position * div_term)
         
         #将二维张量改为三维张量
         pe = pe.unsqueeze(0)
+        #pe 是位置张量 二维 包含一个句子的 位置 和 该位置的词向量长度
+        #假设一句话有 10 个词，每个词用一个 512 维的向量表示，那么这句话的数据形状就是 (10, 512)，即 (seq_len, d_model)。这是一个二维张量。
+        #但实际上 为了加快训练速度，我们通常把多句话打包在一起同时处理
+        #比如一次喂入 32 句话。这时数据形状就变成了 (32, 10, 512)，即 (batch_size, seq_len, d_model)。这就是三维张量。
+        #位置编码 pe原本是二维的 (max_len, d_model)，只能对应一句话的情况。为了能和三维的输入 x相加，就需要在 pe前面加一个维度变成 (1, max_len, d_model)
 
         self.register_buffer('pe',pe)
 
@@ -78,7 +80,7 @@ def attention(query, key ,value , mask = None , dropout = None):
 
     #判断是否使用掩码张量
     if mask is not None:
-        scores = scores.masked_fill(mask == 0,-1e9)
+        scores = scores.masked_fill(mask == 0,-1e9)   #有mask的话 换成-1e9 这样softmax函数直接变零
     p_attn = F.softmax(scores,dim = -1)
 
     if dropout is not None:
@@ -101,7 +103,8 @@ class MultiHeadedAttention(nn.Module):
         #dropout:进行Dropout操作时 置零的比率
         super(MultiHeadedAttention , self).__init__() 
         #要确认一个事实：多头的数量需要整除词嵌入的维度 分而治之
-        assert embedding_dim % head == 0
+        #why？实际上 每个多头只是分析一个词向量的一个部分 而每个多头长度要相同（等效） 所以要能整除
+        assert embedding_dim % head == 0  #assert相当于if 符合条件继续运行
 
         #得到每个头获得的词向量的维度
         self.d_k = embedding_dim // head
@@ -119,9 +122,9 @@ class MultiHeadedAttention(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
     
     def forward(self,query,key,value,mask = None):
-        #query,key,value:代表注意力的三个输入张量 mask:掩码张量
+    #query,key,value:代表注意力的三个输入张量 mask:掩码张量
         if mask is not None:
-            #先将mask进行维度扩充 因为多头注意力机制需要n个头的mask
+        #先将mask进行维度扩充 因为多头注意力机制需要n个头的mask
             mask = mask.unsqueeze(1)
         
         #得到batch_size
@@ -173,8 +176,10 @@ class PositionWiseFeedForward(nn.Module):
         super(PositionWiseFeedForward,self).__init__()
     
         #初始化两个全连接层
-        self.w1 = nn.Linear(d_model,d_ff)
+        self.w1 = nn.Linear(d_model,d_ff)     
+        #将512维向量转成2048维 进行线性计算
         self.w2 = nn.Linear(d_ff ,d_model)
+        #将2048维转回512维 词向量
         self.dropout = nn.Dropout(p=dropout)
     
     def forward(self ,x):
@@ -208,6 +213,7 @@ class LayerNorm(nn.Module):
         return self.a2 * (x-mean) / (std + self.eps) + self.b2
     
 #构建子层连接结构
+#add+norm 其实就是残差连接和归一化 加上正则化 residual
 class SublayerConnection(nn.Module):
     def __init__(self,size,dropout =0.1):
         #size:词嵌入的维度
@@ -241,15 +247,16 @@ class EncodeLayer(nn.Module):
         self.sublayer = clones(SublayerConnection(size,dropout),2)
 
     def forward(self ,x,mask):
-        #首先让x经过第一个子层连接结构 内部包含多头自注意力机制子层
-        #再让张量经过第二个子层连接结构 其中包含前馈全连接网络
+        #[0],[1] 克隆的sublayer 像数组
         x = self.sublayer[0](x,lambda x: self.self_attn(x,x,x,mask))
+        #先对 x做 LayerNorm，然后送入多头自注意力层，结果经过 Dropout，最后与原始 x残差相加
         return self.sublayer[1](x,self.feed_forward)
+        #将第一个子层的输出 x先做 LayerNorm，然后送入前馈网络，结果经过 Dropout，再与输入 x残差相加，最后返回
 
 class Encoder(nn.Module):
     def __init__(self, layer ,N):
         super(Encoder ,self).__init__()
-        #首先使用clones函数 克隆N个编码器 放置在self.layers中
+    #首先使用clones函数 克隆N个编码器 放置在self.layers中
         self.layers = clones(layer,N)
         #初始化一个规范化层 作用在编码器的最后面
         self.norm = LayerNorm(layer.size)
@@ -300,7 +307,7 @@ class DecoderLayer(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, layer ,N):
         super(Decoder ,self).__init__()
-        #首先使用clones函数 克隆N个解码器 放置在self.layers中
+    #首先使用clones函数 克隆N个解码器 放置在self.layers中
         self.layers = clones(layer,N)
         #初始化一个规范化层
         self.norm = LayerNorm(layer.size)
@@ -351,7 +358,10 @@ class EncoderDecoder(nn.Module):
         return self.decoder(self.tgt_embed(target),memory ,source_mask ,target_mask)
     
 def make_model(source_vocab ,target_vocab ,N=6 ,d_model=512,d_ff=2048, head=8,dropout =0.1):
-    #source_vocab：词汇总数
+    #玩具 demo（几百句）    调小模型 N=2, d_model=64, d_ff=128
+    #正规翻译（万级）	    N=4, d_model=256 先跑通
+    #论文级（百万句对）	    N=6, d_model=512 原文配置
+    # #source_vocab：词汇总数
     #target_vocab：目标词汇总数
     #N：代表编码器和解码器堆叠的层数
     #d_model：词嵌入维度
@@ -360,18 +370,18 @@ def make_model(source_vocab ,target_vocab ,N=6 ,d_model=512,d_ff=2048, head=8,dr
     #dropout：置零比率
     c = copy.deepcopy
 
-    #实例化一个多头注意力的类
+#实例化一个多头注意力的类
     attn = MultiHeadedAttention(head ,d_model)
 
-    #实例化一个前馈全连接层网络对象
+#实例化一个前馈全连接层网络对象
     ff = PositionWiseFeedForward(d_model,d_ff ,dropout)
 
-    #实例化一个位置编码器
+#实例化一个位置编码器
     position = PositionalEncoding(d_model ,dropout)
 
-    #实例化模型model 利用EncoderDecoder类
-    #编码器中的结构里有2个子层 attention层和前馈全连接层
-    #解码器中有3个子层 两个attention层和前馈全连接层
+#实例化模型model 利用EncoderDecoder类
+#编码器中的结构里有2个子层 attention层和前馈全连接层
+#解码器中有3个子层 两个attention层和前馈全连接层
     model = EncoderDecoder(
         Encoder(EncodeLayer(d_model ,c(attn) ,c(ff) ,dropout),N),
         Decoder(DecoderLayer(d_model ,c(attn),c(attn),c(ff),dropout),N),
@@ -379,10 +389,12 @@ def make_model(source_vocab ,target_vocab ,N=6 ,d_model=512,d_ff=2048, head=8,dr
         nn.Sequential(Embedding(d_model,target_vocab),c(position)),
         Generator(d_model,target_vocab))
     
-    #初始化整个模型的参数 判断参数的维度dim>1 将矩阵初始化成一个服从均匀分布的矩阵
+#初始化整个模型的参数 判断参数的维度dim>1 将矩阵初始化成一个服从均匀分布的矩阵
     for p in model.parameters():
         if p.dim() >1:
             nn.init.xavier_uniform_(p)
+            #对所有维度大于 1 的参数（即权重矩阵，不包括偏置和 LayerNorm 的缩放因子）使用 Xavier 均匀初始化
+            # 有助于梯度流动和训练稳定性。
     return model
 
 
