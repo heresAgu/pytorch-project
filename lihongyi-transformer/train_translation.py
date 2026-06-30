@@ -1,72 +1,36 @@
-﻿import torch, math, time, os, re
+﻿import torch, math, time, os, glob
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from collections import Counter
 import sys
 sys.path.insert(0, r'E:\pytorch-project\lihongyi-transformer')
 from transformer_model import make_model, subsequent_mask
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = 'cuda'
 BATCH = 64
-EPOCHS = 5
+EPOCHS = 20
 D_MODEL = 128
 D_FF = 512
 N = 2
 HEADS = 4
-LR = 0.0005
-MAX_LEN = 20
-MIN_FREQ = 5
-
-def tok_en(s):
-    s = s.lower().strip()
-    s = re.sub(r'([.,!?;:])', r' \1 ', s)
-    return s.split()
-
-def tok_zh(s):
-    s = s.strip()
-    return [c for c in s if '\u4e00' <= c <= '\u9fff' or c in '，。！？']
-
-print('加载数据...')
-pairs = []
-with open(r'E:\pytorch-project\data\cmn.txt', 'r', encoding='utf-8') as f:
-    for line in f:
-        parts = line.strip().split('\t')
-        if len(parts) >= 2:
-            pairs.append((parts[0], parts[1]))
-
-en_tok = [tok_en(p[0]) for p in pairs]
-zh_tok = [tok_zh(p[1]) for p in pairs]
-
-# 构建词表
+LR = 0.0003
 PAD, BOS, EOS = 0, 1, 2
-en_vocab = Counter(t for seq in en_tok for t in seq)
-zh_vocab = Counter(t for seq in zh_tok for t in seq)
+CKPT_DIR = r'E:\pytorch-project\checkpoints'
+os.makedirs(CKPT_DIR, exist_ok=True)
 
-# 加入 <unk> 处理未登录词
-en_i2w = [PAD, BOS, EOS, '<unk>'] + sorted([w for w, c in en_vocab.items() if c >= MIN_FREQ])
-zh_i2w = [PAD, BOS, EOS, '<unk>'] + sorted([w for w, c in zh_vocab.items() if c >= MIN_FREQ])
-en_w2i = {w:i for i,w in enumerate(en_i2w)}
-zh_w2i = {w:i for i,w in enumerate(zh_i2w)}
+print('Loading preprocessed data...')
+data = torch.load(r'E:\pytorch-project\data\preprocessed.pt')
+train_en, train_zh = data['train_en'], data['train_zh']
+val_en, val_zh = data['val_en'], data['val_zh']
+en_i2w, zh_i2w = data['en_i2w'], data['zh_i2w']
+print('Train: %d  Val: %d' % (len(train_en), len(val_en)))
 
-print('英文词表:%d 中文词表:%d 数据:%d条' % (len(en_w2i), len(zh_w2i), len(pairs)))
-
-# 数据集
 class DS(Dataset):
-    def __init__(self, d):
-        self.d = d
-    def __len__(self): return len(self.d)
-    def __getitem__(self, i): return self.d[i]
-
-def make_data(pairs, en_tok, zh_tok):
-    data = []
-    for (en, zh), e_tok, z_tok in zip(pairs, en_tok, zh_tok):
-        e_ids = [en_w2i.get(t, 3) for t in e_tok[:MAX_LEN-2]]  # 3=<unk>
-        z_ids = [zh_w2i.get(t, 3) for t in z_tok[:MAX_LEN-2]]
-        data.append((torch.tensor([1]+e_ids+[2]), torch.tensor([1]+z_ids+[2])))
-    return data
+    def __init__(self, en, zh):
+        self.data = [(torch.tensor([BOS]+e+[EOS]), torch.tensor([BOS]+z+[EOS])) for e,z in zip(en,zh)]
+    def __len__(self): return len(self.data)
+    def __getitem__(self, i): return self.data[i]
 
 def collate(batch):
-    pad = 0
     max_src = max(len(s) for s,_ in batch)
     max_tgt = max(len(t) for _,t in batch)
     src = torch.stack([torch.cat([s, torch.zeros(max_src-len(s), dtype=torch.long)]) for s,_ in batch])
@@ -74,30 +38,37 @@ def collate(batch):
     tout = torch.stack([torch.cat([t[1:], torch.zeros(max_tgt-len(t)+1, dtype=torch.long)]) for _,t in batch])
     return src.long(), tin.long(), tout.long()
 
-split = int(len(pairs)*0.9)
-train_loader = DataLoader(DS(make_data(pairs[:split], en_tok[:split], zh_tok[:split])),
-                          BATCH, True, collate_fn=collate)
-val_loader = DataLoader(DS(make_data(pairs[split:], en_tok[split:], zh_tok[split:])),
-                        32, False, collate_fn=collate)
-
-print('训练:%d 验证:%d' % (len(train_loader.dataset), len(val_loader.dataset)))
+train_loader = DataLoader(DS(train_en, train_zh), BATCH, True, collate_fn=collate)
+val_loader = DataLoader(DS(val_en, val_zh), BATCH, False, collate_fn=collate)
 
 model = make_model(len(en_i2w), len(zh_i2w), N, D_MODEL, D_FF, HEADS, 0.1).to(DEVICE)
 opt = torch.optim.Adam(model.parameters(), lr=LR)
-crit = nn.NLLLoss(ignore_index=0)
-print('参数:%d 设备:%s' % (sum(p.numel() for p in model.parameters()), DEVICE))
+crit = nn.NLLLoss(ignore_index=PAD)
+
+# 检测是否有 checkpoint 可恢复
+start_epoch = 0
+ckpt_files = sorted(glob.glob(os.path.join(CKPT_DIR, 'checkpoint_epoch_*.pt')),
+                    key=lambda x: int(x.split('_')[-1].replace('.pt','')))
+if ckpt_files:
+    latest = ckpt_files[-1]
+    start_epoch = int(latest.split('_')[-1].replace('.pt',''))
+    ckpt = torch.load(latest)
+    model.load_state_dict(ckpt['model'])
+    opt.load_state_dict(ckpt['optimizer'])
+    print('Resumed from %s (epoch %d)' % (latest, start_epoch))
+
+print('Params: %d' % sum(p.numel() for p in model.parameters()))
 print()
 
-for epoch in range(EPOCHS):
+for epoch in range(start_epoch, EPOCHS):
     model.train()
     ls, t0 = 0, time.time()
     for src, tin, tout in train_loader:
         src, tin, tout = src.to(DEVICE), tin.to(DEVICE), tout.to(DEVICE)
         sm = (src!=0).unsqueeze(1)
         tm = subsequent_mask(tin.size(1)).to(DEVICE)
-        mem = model.encode(src, sm)
-        pred = model.generator(model.decode(mem, sm, tin, tm))
-        loss = crit(pred.reshape(-1, len(zh_i2w)), tout.reshape(-1))
+        pred = model.generator(model.decode(model.encode(src,sm), sm, tin, tm))
+        loss = crit(pred.reshape(-1,len(zh_i2w)), tout.reshape(-1))
         opt.zero_grad(); loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -113,9 +84,23 @@ for epoch in range(EPOCHS):
             pred = model.generator(model.decode(model.encode(src,sm), sm, tin, tm))
             vls += crit(pred.reshape(-1,len(zh_i2w)), tout.reshape(-1)).item()
     
-    print('Epoch %d | train=%.3f | val=%.3f | ppl=%.1f | %.1fs' % (
-        epoch+1, ls/len(train_loader), vls/len(val_loader), math.exp(vls/len(val_loader)), time.time()-t0))
+    dt = time.time()-t0
+    train_loss = ls/len(train_loader)
+    val_loss = vls/len(val_loader)
+    print('Epoch %2d/%d | train=%.3f | val=%.3f | ppl=%.1f | %.1fs' % (
+        epoch+1, EPOCHS, train_loss, val_loss, math.exp(val_loss), dt))
+    
+    # 每轮保存 checkpoint
+    torch.save({
+        'epoch': epoch+1, 'model': model.state_dict(), 'optimizer': opt.state_dict(),
+        'train_loss': train_loss, 'val_loss': val_loss,
+    }, os.path.join(CKPT_DIR, 'checkpoint_epoch_%d.pt' % (epoch+1)))
 
-torch.save({'model':model.state_dict(),'en_i2w':en_i2w,'zh_i2w':zh_i2w,'d_model':D_MODEL,'d_ff':D_FF,'n':N,'heads':HEADS},
+# 全部跑完 → 保存最终模型并清理旧 checkpoint
+torch.save({'model':model.state_dict(),'en_i2w':en_i2w,'zh_i2w':zh_i2w,
+            'd_model':D_MODEL,'d_ff':D_FF,'n':N,'heads':HEADS},
            r'E:\pytorch-project\lihongyi-transformer\translation_model.pt')
-print('\n已保存!')
+# 可选的: 删掉旧的 checkpoint 省空间
+# for f in glob.glob(os.path.join(CKPT_DIR, 'checkpoint_epoch_*.pt')):
+#     os.remove(f)
+print('Done! Final model saved.')

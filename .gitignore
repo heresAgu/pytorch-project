@@ -1,5 +1,24 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 .vscode/
-data/
+
+# checkpoints
+checkpoints/
+
+# model files
 *.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+
+# data
+data/
+cmn-eng/
+
+# environment
+venv/
+.venv/
+conda_env/
+
+# huggingface cache.cache/
